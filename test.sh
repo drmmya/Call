@@ -1,88 +1,69 @@
 #!/usr/bin/env bash
 set -e
 
-# ========= User input =========
-read -p "Enter domain for HTTPS (leave empty to use only IP/HTTP): " DOMAIN
-if [ -n "$DOMAIN" ]; then
-  read -p "Admin email for Let's Encrypt (e.g., you@example.com): " LE_EMAIL
-fi
-
-INSTALL_DIR="/opt/webrtc-one2one"
-SIG_PORT=8080
+INSTALL_DIR="/opt/webrtc-one2one-ports"
+WEB_PORT=8081
+WS_PORT=8082
 TURN_USER="webrtcuser"
 TURN_PASS="$(head -c 12 /dev/urandom | base64 | tr -dc 'A-Za-z0-9' | head -c16)"
-TURN_REALM="${DOMAIN:-webrtc.local}"
 PUBLIC_IP=$(curl -s https://api.ipify.org || curl -s ifconfig.me || echo "YOUR_PUBLIC_IP")
 
-echo "Public IP detected: $PUBLIC_IP"
+echo "Public IP: $PUBLIC_IP"
 mkdir -p "$INSTALL_DIR"
 cd "$INSTALL_DIR"
 
-# ========= Install Docker =========
+# -------- Docker ----------
 if ! command -v docker >/dev/null 2>&1; then
   apt-get update
   apt-get install -y ca-certificates curl gnupg
   install -m 0755 -d /etc/apt/keyrings
   curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
   chmod a+r /etc/apt/keyrings/docker.gpg
-  echo \
-    "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu \
-    $(. /etc/os-release && echo "$VERSION_CODENAME") stable" | tee /etc/apt/sources.list.d/docker.list > /dev/null
+  echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu $(. /etc/os-release && echo "$VERSION_CODENAME") stable" | tee /etc/apt/sources.list.d/docker.list > /dev/null
   apt-get update
   apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+  systemctl enable docker
+  systemctl start docker
 fi
 
-# Enable & start Docker
-systemctl enable docker
-systemctl start docker
+mkdir -p signal web coturn
 
-# ========= Project layout =========
-mkdir -p signal web caddy coturn
-
-# --- Signaling server (Node + ws) ---
+# -------- Signaling server (Node + ws on WS_PORT) --------
 cat > signal/server.js <<'JS'
 const WebSocket = require('ws');
-const PORT = process.env.PORT || 8080;
+const PORT = process.env.PORT || 8082;
 const wss = new WebSocket.Server({ port: PORT });
 const peers = new Map(); // id -> ws
 
-function safeSend(ws, obj) {
-  try { ws.send(JSON.stringify(obj)); } catch(e) {}
-}
+function safeSend(ws, obj) { try { ws.send(JSON.stringify(obj)); } catch(e) {} }
 
 wss.on('connection', (ws) => {
   let myId = null;
-
   ws.on('message', (buf) => {
-    let msg;
-    try { msg = JSON.parse(buf.toString()); } catch(e) { return; }
+    let msg; try { msg = JSON.parse(buf.toString()); } catch(e) { return; }
 
     if (msg.type === 'join' && typeof msg.id === 'string') {
       myId = msg.id;
       peers.set(myId, ws);
-      // notify all with updated roster
       const roster = Array.from(peers.keys());
-      peers.forEach((cli) => safeSend(cli, { type: 'roster', roster }));
+      peers.forEach(cli => safeSend(cli, { type:'roster', roster }));
       return;
     }
-
-    // relay offer/answer/ice
     if (msg.to && peers.has(msg.to)) {
       const peer = peers.get(msg.to);
       safeSend(peer, { from: myId, type: msg.type, payload: msg.payload });
     }
   });
-
   ws.on('close', () => {
     if (myId) {
       peers.delete(myId);
       const roster = Array.from(peers.keys());
-      peers.forEach((cli) => safeSend(cli, { type: 'roster', roster }));
+      peers.forEach(cli => safeSend(cli, { type:'roster', roster }));
     }
   });
 });
 
-console.log('Signaling server listening on :' + PORT);
+console.log('Signaling server on :' + PORT);
 JS
 
 cat > signal/package.json <<'JSON'
@@ -101,12 +82,12 @@ WORKDIR /app
 COPY package.json ./
 RUN npm install --production
 COPY server.js ./
-ENV PORT=8080
-EXPOSE 8080
+ENV PORT=8082
+EXPOSE 8082
 CMD ["node", "server.js"]
 DOCKER
 
-# --- Web UI (single page) ---
+# -------- Web UI (serves on WEB_PORT) --------
 cat > web/index.html <<'HTML'
 <!DOCTYPE html>
 <html lang="en">
@@ -123,7 +104,7 @@ cat > web/index.html <<'HTML'
   .grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}
   video{width:100%;background:#000;border-radius:12px}
   .roster{display:flex;gap:8px;flex-wrap:wrap}
-  .pill{padding:6px 10px;border:1px solid #334; border-radius:999px}
+  .pill{padding:6px 10px;border:1px solid #334;border-radius:999px}
   .pill button{margin-left:8px}
   small{opacity:.7}
 </style>
@@ -136,7 +117,7 @@ cat > web/index.html <<'HTML'
     <button id="joinBtn">Join</button>
     <small id="status">Disconnected</small>
   </div>
-  <div><small>Tip: Use HTTPS for camera/mic. This demo needs a secure origin.</small></div>
+  <div><small>Open this page on two devices → join with two different names → click Call.</small></div>
 </div>
 
 <div class="card">
@@ -170,12 +151,12 @@ cat > web/index.html <<'HTML'
 HTML
 
 cat > web/app.js <<'JS'
-const params = new URLSearchParams(location.search);
-const WS_URL = params.get('ws') || (location.protocol === 'https:' ? `wss://${location.host}/ws` : `ws://${location.host}/ws`);
-const TURN_URL = params.get('turn') || (location.protocol === 'https:' ? `turn:${location.host}:3478` : `turn:${location.hostname}:3478`);
-const STUN_URL = params.get('stun') || (location.protocol === 'https:' ? `stun:${location.host}:3478` : `stun:${location.hostname}:3478`);
-const TURN_USER = params.get('tu') || 'WEBSERVER_REPL_TURN_USER';
-const TURN_PASS = params.get('tp') || 'WEBSERVER_REPL_TURN_PASS';
+const host = location.hostname;
+const WS_URL = `ws://${host}:8082/ws`;      // fixed to :8082
+const STUN_URL = `stun:${host}:3478`;
+const TURN_URL = `turn:${host}:3478`;
+const TURN_USER = 'WEBSERVER_REPL_TURN_USER';
+const TURN_PASS = 'WEBSERVER_REPL_TURN_PASS';
 
 const nameEl = document.getElementById('name');
 const joinBtn = document.getElementById('joinBtn');
@@ -274,137 +255,73 @@ hangBtn.onclick = ()=>{
 };
 JS
 
-# Replace placeholders for TURN creds in web/app.js
+# Inject TURN creds
 sed -i "s/WEBSERVER_REPL_TURN_USER/${TURN_USER}/g" web/app.js
 sed -i "s/WEBSERVER_REPL_TURN_PASS/${TURN_PASS}/g" web/app.js
 
-# --- Caddy (serves static & proxies /ws) ---
-cat > caddy/Caddyfile <<CADDY
-{$DOMAIN}
-
-encode zstd gzip
-
-@ws path /ws
-handle @ws {
-	reverse_proxy signal:8080
-}
-
-handle {
-	root * /srv
-	file_server
-}
-CADDY
-
-# If no domain, serve on :80 (HTTP only)
-if [ -z "$DOMAIN" ]; then
-  cat > caddy/Caddyfile <<'CADDY'
-:80
-
-encode zstd gzip
-
-@ws path /ws
-handle @ws {
-	reverse_proxy signal:8080
-}
-
-handle {
-	root * /srv
-	file_server
-}
-CADDY
-fi
-
-# --- coturn config ---
+# -------- coturn (host networking for UDP) --------
 cat > coturn/turnserver.conf <<CONF
 listening-port=3478
 tls-listening-port=5349
 external-ip=${PUBLIC_IP}
-realm=${TURN_REALM}
+realm=webrtc.local
 fingerprint
 lt-cred-mech
 user=${TURN_USER}:${TURN_PASS}
 no-cli
 no-loopback-peers
 no-multicast-peers
-# Uncomment below if you later enable TLS with certs mounted:
-# cert=/etc/ssl/turn/fullchain.pem
-# pkey=/etc/ssl/turn/privkey.pem
+# (Optional TLS later) cert=/etc/ssl/turn/fullchain.pem
+# (Optional TLS later) pkey=/etc/ssl/turn/privkey.pem
 CONF
 
-# --- docker-compose ---
-cat > docker-compose.yml <<'YML'
+# -------- docker-compose --------
+cat > docker-compose.yml <<YML
 services:
+  web:
+    image: nginx:alpine
+    restart: unless-stopped
+    ports:
+      - "${WEB_PORT}:80"
+    volumes:
+      - ./web:/usr/share/nginx/html:ro
+
   signal:
     build: ./signal
     restart: unless-stopped
     ports:
-      - "8080:8080"
-  caddy:
-    image: caddy:2
-    restart: unless-stopped
-    ports:
-      - "80:80"
-      - "443:443"
-    environment:
-      - ACME_AGREE=true
-    volumes:
-      - ./caddy/Caddyfile:/etc/caddy/Caddyfile
-      - ./web:/srv
-      - caddy_data:/data
-      - caddy_config:/config
-    depends_on:
-      - signal
+      - "${WS_PORT}:8082"
+
   coturn:
     image: coturn/coturn:latest
     restart: unless-stopped
     network_mode: host
     volumes:
       - ./coturn/turnserver.conf:/etc/turnserver.conf
-volumes:
-  caddy_data:
-  caddy_config:
 YML
 
-# If domain present, add email & domain env to Caddyfile header
-if [ -n "$DOMAIN" ]; then
-  # Prepend domain and email to Caddyfile (already has {$DOMAIN})
-  sed -i "1s#^#{$DOMAIN}\n#;" caddy/Caddyfile
-  export DOMAIN
-  export LE_EMAIL
-  # Add email global option
-  sed -i "1s#^#{\n\temail ${LE_EMAIL}\n}\n\n#;" caddy/Caddyfile
-fi
-
-# ========= Firewall (UFW if present) =========
+# -------- firewall (if UFW present) --------
 if command -v ufw >/dev/null 2>&1; then
-  ufw allow 80/tcp || true
-  ufw allow 443/tcp || true
+  ufw allow ${WEB_PORT}/tcp || true
+  ufw allow ${WS_PORT}/tcp || true
   ufw allow 3478/tcp || true
   ufw allow 3478/udp || true
   ufw allow 5349/tcp || true
   ufw allow 5349/udp || true
-  ufw allow 8080/tcp || true
 fi
 
-# ========= Launch =========
 docker compose build
 docker compose up -d
 
 echo
 echo "====================== DONE ======================"
-if [ -n "$DOMAIN" ]; then
-  echo "Web app: https://$DOMAIN"
-  echo "Signaling WS: wss://$DOMAIN/ws"
-  echo "TURN/STUN: stun:$DOMAIN:3478, turn:$DOMAIN:3478"
-else
-  echo "Web app (HTTP only):  http://$PUBLIC_IP"
-  echo "Signaling WS:         ws://$PUBLIC_IP/ws"
-  echo "TURN/STUN:            stun:$PUBLIC_IP:3478, turn:$PUBLIC_IP:3478"
-  echo "NOTE: Without HTTPS, browsers may block camera/mic. Use a domain for full functionality."
-fi
+echo "Open this on two devices/browsers:"
+echo "Web UI:              http://${PUBLIC_IP}:${WEB_PORT}"
+echo "Signaling (WS):      ws://${PUBLIC_IP}:${WS_PORT}/ws"
+echo "TURN/STUN:           stun:${PUBLIC_IP}:3478 , turn:${PUBLIC_IP}:3478"
 echo
-echo "TURN username: $TURN_USER"
-echo "TURN password: $TURN_PASS"
-echo "Project dir:   $INSTALL_DIR"
-echo "Logs:          docker compose logs -f"
+echo "TURN username:       ${TURN_USER}"
+echo "TURN password:       ${TURN_PASS}"
+echo "Project dir:         ${INSTALL_DIR}"
+echo "Logs:                docker compose logs -f"
 echo "=================================================="
