@@ -2,11 +2,13 @@
 set -euo pipefail
 
 # ============================================================
-# RandomCall — Full A→Z Installer (Updated 2025-08-19)
-# - Dockerized stack: Caddy (auto-HTTPS), Node API, Postgres, Redis, coturn
-# - Admin panel served at /admin
-# - Socket.IO auth fix: accepts token from handshake.auth.token OR ?token=
-# - Idempotent: re-run to upgrade without dropping users by default
+# RandomCall — Full A→Z Installer (Fixed 2025-08-19)
+# - Caddy (auto-HTTPS), Node API, Postgres, Redis, coturn
+# - Admin at /admin
+# - Socket.IO auth fix: accepts handshake.auth.token OR ?token=
+# - WebRTC fix: server emits roles; Android properly answers
+# - TURN: external-ip + TCP relay (NAT/restrictive networks)
+# - Idempotent: re-run to upgrade without dropping users
 # ============================================================
 
 if [ "$(id -u)" -ne 0 ]; then
@@ -157,7 +159,7 @@ services:
       TURN_PASSWORD: ${TURN_PASS}
       TURN_PORT: 3478
     volumes:
-      - /var/run/docker.sock:/var/run/docker.sock   # admin can see/restart services
+      - /var/run/docker.sock:/var/run/docker.sock
     healthcheck:
       test: ["CMD","node","/usr/src/app/healthcheck.js"]
       interval: 20s
@@ -175,15 +177,27 @@ services:
       - |
         cat >/etc/turnserver.conf <<EOF
         listening-port=3478
+        listening-ip=0.0.0.0
+        external-ip=${SERVER_IP}
         realm=${SITE_DOMAIN}
         fingerprint
         lt-cred-mech
         user=${TURN_USER}:${TURN_PASS}
+        # Relay over both UDP and TCP (helps in restrictive networks):
+        relay-transport=udp
+        relay-transport=tcp
         no-stdout-log
         no-cli
         min-port=49152
         max-port=65535
         EOF
+
+        # OPTIONAL (recommended): enable TLS relay on 5349.
+        # Requires cert + key paths. Uncomment if you map certs in.
+        # echo "tls-listening-port=5349" >>/etc/turnserver.conf
+        # echo "cert=/certs/fullchain.pem"   >>/etc/turnserver.conf
+        # echo "pkey=/certs/privkey.pem"    >>/etc/turnserver.conf
+
         turnserver -c /etc/turnserver.conf -v
 YML
 
@@ -197,6 +211,7 @@ cat > caddy/Caddyfile <<CADDY
 
 ${SITE_DOMAIN} {
   encode zstd gzip
+  # WebSocket upgrades are automatic with reverse_proxy
 
   @api path /socket.io* /health /v1/* /admin* /v1/admin/*
   reverse_proxy api:3000
@@ -223,7 +238,7 @@ DOCKER
 cat > server/package.json <<'PKG'
 {
   "name": "random-call-backend",
-  "version": "1.4.0",
+  "version": "1.5.0",
   "type": "module",
   "main": "server.js",
   "scripts": { "start": "node server.js" },
@@ -435,7 +450,7 @@ HTML
 cp -r admin server/admin
 
 # -------------------------
-# API server.js (UPDATED)
+# API server.js (FIXED)
 # -------------------------
 cat > server/server.js <<'SRV'
 import express from "express";
@@ -479,7 +494,6 @@ async function setCoins(uid,a){ await db.query("INSERT INTO wallets (user_id,coi
 
 app.get("/health", (_req,res)=>res.json({ok:true}));
 
-// Basic "me" endpoint (optional; useful for client refresh)
 app.get("/v1/me", async (req,res)=>{
   try{
     const h=req.headers.authorization||""; const t=h.startsWith("Bearer ")?h.slice(7):null;
@@ -497,8 +511,19 @@ app.post("/v1/auth/google", async (req,res)=>{
     const p = t.getPayload(); const uid = await ensureUser(p.email, p.name, p.picture);
     const appJwt = jwt.sign({userId: uid, email: p.email}, JWT_SECRET, {expiresIn:"30d"});
     const coins = await getCoins(uid);
-    return res.json({ token: appJwt, userId: uid, email: p.email, coins,
-      turn:{ urls:[`stun:stun.l.google.com:19302`,`turn:${TURN_HOST}:${TURN_PORT}`], username: TURN_USERNAME, credential: TURN_PASSWORD }});
+    return res.json({
+      token: appJwt, userId: uid, email: p.email, coins,
+      turn:{
+        urls:[
+          `stun:stun.l.google.com:19302`,
+          `turn:${TURN_HOST}:${TURN_PORT}`,
+          `turn:${TURN_HOST}:${TURN_PORT}?transport=tcp`,
+          // enable 'turns:5349' if you configured TLS in coturn:
+          // `turns:${TURN_HOST}:5349?transport=tcp`
+        ],
+        username: TURN_USERNAME, credential: TURN_PASSWORD
+      }
+    });
   }catch{ return res.status(401).json({error:"Invalid Google token"}); }
 });
 
@@ -543,8 +568,7 @@ app.get("/v1/admin/calls", adminAuth, async (_req,res)=>{
 });
 
 // ---------------------
-// Socket.IO (UPDATED AUTH)
-// Accept token from handshake.auth.token OR query (?token= or ?auth[token])
+// Socket.IO AUTH (accept handshake.auth.token OR ?token=)
 // ---------------------
 io.use((socket,next)=>{
   try{
@@ -565,10 +589,18 @@ io.on("connection",(socket)=>{
   socket.on("joinQueue",async ({kind})=>{
     if(!["audio","video"].includes(kind)) return; socket.join(`queue:${kind}`);
     const peers=(await io.in(`queue:${kind}`).fetchSockets()).filter(s=>s.id!==socket.id);
-    if(peers.length>0){ const peer=peers[Math.floor(Math.random()*peers.length)]; const callId=uuidv4();
-      await db.query("INSERT INTO calls (id,caller_id,callee_id,kind,status) VALUES ($1,$2,$3,$4,'active')",[callId,userId,(socketToUser.get(peer.id)||{}).userId,kind]);
+    if(peers.length>0){
+      const peer=peers[Math.floor(Math.random()*peers.length)];
+      const callId=uuidv4();
+      const calleeId=(socketToUser.get(peer.id)||{}).userId;
+      await db.query("INSERT INTO calls (id,caller_id,callee_id,kind,status) VALUES ($1,$2,$3,$4,'active')",[callId,userId,calleeId,kind]);
       const room=`call:${callId}`; socket.join(room); peer.join(room); socket.leave(`queue:${kind}`); peer.leave(`queue:${kind}`);
-      await redis.hSet(`call:${callId}`,{kind,status:"active",ts:Date.now().toString()}); io.to(room).emit("matchFound",{callId,room,kind,coinRate:COST[kind]}); }});
+      await redis.hSet(`call:${callId}`,{kind,status:"active",ts:Date.now().toString()});
+      // Emit explicit roles so only one side offers
+      io.to(socket.id).emit("matchFound",{callId,room,kind,coinRate:COST[kind],role:"caller"});
+      io.to(peer.id).emit("matchFound",{callId,room,kind,coinRate:COST[kind],role:"callee"});
+    }
+  });
 
   socket.on("signal",({room,type,payload})=>io.to(room).emit("signal",{from:socket.id,type,payload}));
   socket.on("endCall",async ({callId})=>{ await endCall(callId); });
@@ -629,6 +661,8 @@ ufw allow 80,443/tcp || true
 ufw allow 3478/tcp || true
 ufw allow 3478/udp || true
 ufw allow 49152:65535/udp || true
+# If you enable TLS TURN on 5349:
+# ufw allow 5349/tcp || true
 echo "y" | ufw enable || true
 
 # -------------------------
