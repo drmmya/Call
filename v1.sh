@@ -1,47 +1,42 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# ============================================================
-# RandomCall — Full A→Z Installer (Fixed 2025-08-19)
-# - Caddy (auto-HTTPS), Node API, Postgres, Redis, coturn
-# - Admin at /admin
-# - Socket.IO auth fix: accepts handshake.auth.token OR ?token=
-# - WebRTC fix: server emits roles; Android properly answers
-# - TURN: external-ip + TCP relay (NAT/restrictive networks)
-# - Idempotent: re-run to upgrade without dropping users
-# ============================================================
+# =========================================================
+# RandomCall: one-shot installer (Docker/Caddy/Postgres/Redis/coturn/API/Admin)
+# =========================================================
 
 if [ "$(id -u)" -ne 0 ]; then
   echo "Run as root: sudo bash $0"; exit 1
 fi
 
-# -------------------------
-# Prompts (required)
-# -------------------------
-read -rp "Let's Encrypt email (TLS certs): " LE_EMAIL
-while [[ -z "${LE_EMAIL}" ]]; do read -rp "Email cannot be empty: " LE_EMAIL; done
+DEFAULT_LE_EMAIL="easinalam10@gmail.com"
+DEFAULT_SITE_DOMAIN="randomcall.ovpndev.xyz"
+DEFAULT_GOOGLE_CLIENT_ID="542978261067-va6kbnm4i85oeelqikibmlqhm7h9672r.apps.googleusercontent.com"
 
-read -rp "Site domain (e.g. randomcall.yourdomain.com): " SITE_DOMAIN
-while [[ -z "${SITE_DOMAIN}" ]]; do read -rp "Domain cannot be empty: " SITE_DOMAIN; done
+read -rp "Let's Encrypt email (TLS certs) [${DEFAULT_LE_EMAIL}]: " LE_EMAIL
+LE_EMAIL="${LE_EMAIL:-$DEFAULT_LE_EMAIL}"
 
-read -rp "TURN domain or IP (Enter to use server public IP): " TURN_HOST
+read -rp "Site domain (e.g. randomcall.yourdomain.com) [${DEFAULT_SITE_DOMAIN}]: " SITE_DOMAIN
+SITE_DOMAIN="${SITE_DOMAIN:-$DEFAULT_SITE_DOMAIN}"
+
 SERVER_IP="$(curl -fsS https://api.ipify.org || true)"
+read -rp "TURN domain or IP (Enter to use server IP: ${SERVER_IP}): " TURN_HOST
 if [[ -z "${TURN_HOST}" ]]; then
   TURN_HOST="${SERVER_IP}"
   echo "Using server IP for TURN: ${TURN_HOST}"
 fi
 
-read -rp "Google OAuth WEB client ID: " GOOGLE_CLIENT_ID
-while [[ -z "${GOOGLE_CLIENT_ID}" ]]; do read -rp "Client ID cannot be empty: " GOOGLE_CLIENT_ID; done
+read -rp "Google OAuth WEB client ID [${DEFAULT_GOOGLE_CLIENT_ID}]: " GOOGLE_CLIENT_ID
+GOOGLE_CLIENT_ID="${GOOGLE_CLIENT_ID:-$DEFAULT_GOOGLE_CLIENT_ID}"
 
-read -rp "Admin username for /admin: " ADMIN_USER
-while [[ -z "${ADMIN_USER}" ]]; do read -rp "Admin username cannot be empty: " ADMIN_USER; done
-read -rsp "Admin password for /admin: " ADMIN_PASS; echo
-while [[ -z "${ADMIN_PASS}" ]]; do read -rsp "Admin password cannot be empty: " ADMIN_PASS; echo; done
+read -rp "Admin username for /admin [admin]: " ADMIN_USER
+ADMIN_USER="${ADMIN_USER:-admin}"
+read -rsp "Admin password for /admin (default random strong if empty): " ADMIN_PASS; echo
+if [[ -z "${ADMIN_PASS}" ]]; then ADMIN_PASS="$(openssl rand -base64 24)"; echo "Generated admin password: ${ADMIN_PASS}"; fi
 
-# -------------------------
-# Packages + Docker
-# -------------------------
+# =========================
+# Base packages + Docker
+# =========================
 apt-get update
 apt-get install -y ca-certificates curl gnupg ufw
 
@@ -51,15 +46,15 @@ chmod a+r /etc/apt/keyrings/docker.gpg
 . /etc/os-release
 echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu ${VERSION_CODENAME} stable" \
   > /etc/apt/sources.list.d/docker.list
-
 apt-get update
 apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+
 systemctl enable docker
 systemctl start docker
 
-# -------------------------
+# =========================
 # Stop anything on 80/443
-# -------------------------
+# =========================
 echo "[Cleanup] Stopping anything listening on :80/:443 ..."
 systemctl stop nginx 2>/dev/null || true
 systemctl disable nginx 2>/dev/null || true
@@ -73,14 +68,14 @@ for id in "${OLD80[@]}" "${OLD443[@]}"; do
   [ -n "${id:-}" ] && docker stop "$id" 2>/dev/null || true
 done
 
-# -------------------------
+# =========================
 # App layout & secrets
-# -------------------------
+# =========================
 APP_DIR="/opt/random-call"
 mkdir -p "$APP_DIR"
 cd "$APP_DIR"
 
-# Reuse existing secrets on re-run
+# reuse existing secrets on re-run
 if [[ -f .env ]]; then set -a; source ./.env; set +a || true; fi
 DB_PASS="${DB_PASS:-$(openssl rand -hex 16)}"
 REDIS_PASS="${REDIS_PASS:-$(openssl rand -hex 16)}"
@@ -90,10 +85,10 @@ TURN_PASS="${TURN_PASS:-$(openssl rand -hex 16)}"
 
 mkdir -p data/postgres data/redis server admin caddy
 
-# -------------------------
-# docker-compose (Caddy reverse proxy)
-# -------------------------
-cat > docker-compose.yml <<'YML'
+# =========================
+# docker-compose (Caddy reverse proxy + core services)
+# =========================
+cat > docker-compose.yml <<YML
 services:
   caddy:
     image: caddy:2-alpine
@@ -122,7 +117,7 @@ services:
       test: ["CMD-SHELL","pg_isready -U rcuser -d rcdb"]
       interval: 10s
       timeout: 5s
-      retries: 10
+      retries: 20
 
   redis:
     image: redis:7-alpine
@@ -135,7 +130,7 @@ services:
       test: ["CMD","redis-cli","-a","${REDIS_PASS}","ping"]
       interval: 10s
       timeout: 5s
-      retries: 10
+      retries: 20
 
   api:
     build:
@@ -158,13 +153,14 @@ services:
       TURN_USERNAME: ${TURN_USER}
       TURN_PASSWORD: ${TURN_PASS}
       TURN_PORT: 3478
+      SITE_DOMAIN: ${SITE_DOMAIN}
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
     healthcheck:
       test: ["CMD","node","/usr/src/app/healthcheck.js"]
       interval: 20s
       timeout: 5s
-      retries: 10
+      retries: 20
 
   coturn:
     image: instrumentisto/coturn
@@ -177,41 +173,34 @@ services:
       - |
         cat >/etc/turnserver.conf <<EOF
         listening-port=3478
-        listening-ip=0.0.0.0
-        external-ip=${SERVER_IP}
         realm=${SITE_DOMAIN}
         fingerprint
         lt-cred-mech
         user=${TURN_USER}:${TURN_PASS}
-        # Relay over both UDP and TCP (helps in restrictive networks):
-        relay-transport=udp
-        relay-transport=tcp
         no-stdout-log
         no-cli
         min-port=49152
         max-port=65535
+        listening-ip=0.0.0.0
+        external-ip=${TURN_HOST}
+        stale-nonce
+        no-tls
+        no-dtls
         EOF
-
-        # OPTIONAL (recommended): enable TLS relay on 5349.
-        # Requires cert + key paths. Uncomment if you map certs in.
-        # echo "tls-listening-port=5349" >>/etc/turnserver.conf
-        # echo "cert=/certs/fullchain.pem"   >>/etc/turnserver.conf
-        # echo "pkey=/certs/privkey.pem"    >>/etc/turnserver.conf
-
         turnserver -c /etc/turnserver.conf -v
 YML
 
-# -------------------------
+# =========================
 # Caddyfile (auto-HTTPS)
-# -------------------------
+# =========================
 cat > caddy/Caddyfile <<CADDY
 {
   email ${LE_EMAIL}
+  auto_https disable_redirects
 }
 
 ${SITE_DOMAIN} {
   encode zstd gzip
-  # WebSocket upgrades are automatic with reverse_proxy
 
   @api path /socket.io* /health /v1/* /admin* /v1/admin/*
   reverse_proxy api:3000
@@ -222,9 +211,9 @@ ${SITE_DOMAIN} {
 }
 CADDY
 
-# -------------------------
+# =========================
 # API Dockerfile + code
-# -------------------------
+# =========================
 cat > server/Dockerfile <<'DOCKER'
 FROM node:20-alpine
 WORKDIR /usr/src/app
@@ -238,7 +227,7 @@ DOCKER
 cat > server/package.json <<'PKG'
 {
   "name": "random-call-backend",
-  "version": "1.5.0",
+  "version": "1.4.0",
   "type": "module",
   "main": "server.js",
   "scripts": { "start": "node server.js" },
@@ -264,13 +253,13 @@ CREATE TABLE IF NOT EXISTS users (
   email TEXT UNIQUE NOT NULL,
   display_name TEXT,
   avatar_url TEXT,
-  created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+  created_at TIMESTAMPTZ DEFAULT NOW()
 );
 
 CREATE TABLE IF NOT EXISTS wallets (
   user_id UUID PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
   coins BIGINT NOT NULL DEFAULT 0,
-  updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+  updated_at TIMESTAMPTZ DEFAULT NOW()
 );
 
 DO $$
@@ -289,8 +278,8 @@ CREATE TABLE IF NOT EXISTS calls (
   callee_id UUID REFERENCES users(id),
   kind call_kind NOT NULL,
   status call_status NOT NULL DEFAULT 'active',
-  started_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
-  ended_at TIMESTAMP WITH TIME ZONE
+  started_at TIMESTAMPTZ DEFAULT NOW(),
+  ended_at TIMESTAMPTZ
 );
 
 CREATE INDEX IF NOT EXISTS calls_started_idx ON calls(started_at DESC);
@@ -301,8 +290,24 @@ CREATE TABLE IF NOT EXISTS messages (
   sender_id UUID REFERENCES users(id),
   receiver_id UUID REFERENCES users(id),
   body TEXT,
-  created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+  created_at TIMESTAMPTZ DEFAULT NOW()
 );
+
+-- Upfront charge ledger
+CREATE TABLE IF NOT EXISTS call_charges (
+  id UUID PRIMARY KEY,
+  call_id UUID REFERENCES calls(id) ON DELETE CASCADE,
+  user_id UUID REFERENCES users(id) ON DELETE CASCADE,
+  amount BIGINT NOT NULL,
+  created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- Don't allow >1 active call per user
+CREATE UNIQUE INDEX IF NOT EXISTS one_active_call_per_user
+ON calls (caller_id) WHERE status = 'active';
+
+CREATE UNIQUE INDEX IF NOT EXISTS one_active_call_per_user_2
+ON calls (callee_id) WHERE status = 'active';
 SQL
 
 cat > server/healthcheck.js <<'HC'
@@ -374,8 +379,8 @@ window.loadServices = async function(){
     list.forEach(s => {
       const div = document.createElement('div');
       div.innerHTML = `<strong>${s.name}</strong> :
-        <span class="${s.running ? 'ok':'bad'}">${s.state}</span>
-        <button onclick="restartSvc('${s.name}')">Restart</button>`;
+        <span class="\${s.running ? 'ok':'bad'}">\${s.state}</span>
+        <button onclick="restartSvc('\${s.name}')">Restart</button>`;
       el.appendChild(div);
     });
   }catch(e){ setMsg('Services error: ' + e); }
@@ -394,12 +399,12 @@ window.loadUsers = async function(){
   const tb = document.querySelector('#usersTbl tbody'); tb.innerHTML = "";
   users.forEach(u => {
     const tr = document.createElement('tr');
-    tr.innerHTML = `<td>${u.email}</td><td>${u.display_name||''}</td><td>${u.coins}</td>
+    tr.innerHTML = `<td>\${u.email}</td><td>\${u.display_name||''}</td><td>\${u.coins}</td>
       <td>
-        <button onclick="coinAdd('${u.id}',10)">+10</button>
-        <button onclick="coinAdd('${u.id}',100)">+100</button>
-        <button onclick="coinAdd('${u.id}',-10)">-10</button>
-        <button onclick="coinSetPrompt('${u.id}')">Set…</button>
+        <button onclick="coinAdd('\${u.id}',10)">+10</button>
+        <button onclick="coinAdd('\${u.id}',100)">+100</button>
+        <button onclick="coinAdd('\${u.id}',-10)">-10</button>
+        <button onclick="coinSetPrompt('\${u.id}')">Set…</button>
       </td>`;
     tb.appendChild(tr);
   });
@@ -432,7 +437,7 @@ async function loadCalls(){
   const tb = document.querySelector('#callsTbl tbody'); tb.innerHTML = "";
   rows.forEach(c => {
     const tr = document.createElement('tr');
-    tr.innerHTML = `<td>${c.id}</td><td>${c.kind}</td><td>${c.status}</td><td>${c.started_at}</td><td>${c.ended_at||''}</td>`;
+    tr.innerHTML = `<td>\${c.id}</td><td>\${c.kind}</td><td>\${c.status}</td><td>\${c.started_at}</td><td>\${c.ended_at||''}</td>`;
     tb.appendChild(tr);
   });
 }
@@ -446,12 +451,9 @@ async function refreshAll(){ await loadServices(); await loadUsers(); await load
 </script></body></html>
 HTML
 
-# Copy admin into server image
+# copy admin into server so it’s inside the image
 cp -r admin server/admin
 
-# -------------------------
-# API server.js (FIXED)
-# -------------------------
 cat > server/server.js <<'SRV'
 import express from "express";
 import http from "http";
@@ -470,10 +472,24 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 const {
   PORT = 3000, DATABASE_URL, REDIS_URL, JWT_SECRET,
   GOOGLE_CLIENT_ID, ADMIN_USER, ADMIN_PASS,
-  TURN_HOST, TURN_USERNAME, TURN_PASSWORD, TURN_PORT = 3478
+  TURN_HOST, TURN_USERNAME, TURN_PASSWORD, TURN_PORT = 3478,
+  SITE_DOMAIN
 } = process.env;
 
-const app = express(); app.use(cors()); app.use(express.json());
+const app = express();
+
+// (Optional) restrict CORS to your domain + localhost dev
+const allowed = new Set([
+  `https://${SITE_DOMAIN}`,
+  "http://localhost:5173",
+  "http://localhost:3000"
+]);
+app.use(cors({
+  origin: (o, cb) => { if (!o || allowed.has(o)) return cb(null, true); return cb(new Error("CORS blocked")); },
+  credentials: true
+}));
+
+app.use(express.json());
 const server = http.createServer(app);
 const io = new SocketIOServer(server, { cors: { origin: "*" }, path: "/socket.io" });
 
@@ -494,16 +510,7 @@ async function setCoins(uid,a){ await db.query("INSERT INTO wallets (user_id,coi
 
 app.get("/health", (_req,res)=>res.json({ok:true}));
 
-app.get("/v1/me", async (req,res)=>{
-  try{
-    const h=req.headers.authorization||""; const t=h.startsWith("Bearer ")?h.slice(7):null;
-    if(!t) return res.status(401).json({error:"Missing token"});
-    const p=jwt.verify(t,JWT_SECRET);
-    const coins=await getCoins(p.userId);
-    res.json({ userId:p.userId, email:p.email, coins });
-  }catch{ res.status(401).json({error:"Invalid token"}); }
-});
-
+// Auth
 app.post("/v1/auth/google", async (req,res)=>{
   const { idToken } = req.body||{}; if(!idToken) return res.status(400).json({error:"idToken required"});
   try{
@@ -511,22 +518,28 @@ app.post("/v1/auth/google", async (req,res)=>{
     const p = t.getPayload(); const uid = await ensureUser(p.email, p.name, p.picture);
     const appJwt = jwt.sign({userId: uid, email: p.email}, JWT_SECRET, {expiresIn:"30d"});
     const coins = await getCoins(uid);
-    return res.json({
-      token: appJwt, userId: uid, email: p.email, coins,
-      turn:{
-        urls:[
-          `stun:stun.l.google.com:19302`,
-          `turn:${TURN_HOST}:${TURN_PORT}`,
-          `turn:${TURN_HOST}:${TURN_PORT}?transport=tcp`,
-          // enable 'turns:5349' if you configured TLS in coturn:
-          // `turns:${TURN_HOST}:5349?transport=tcp`
-        ],
-        username: TURN_USERNAME, credential: TURN_PASSWORD
-      }
-    });
-  }catch{ return res.status(401).json({error:"Invalid Google token"}); }
+    return res.json({ token: appJwt, userId: uid, email: p.email, coins,
+      turn:{ urls:[`stun:stun.l.google.com:19302`,`turn:${TURN_HOST}:${TURN_PORT}`], username: TURN_USERNAME, credential: TURN_PASSWORD }});
+  }catch(e){ return res.status(401).json({error:"Invalid Google token"}); }
 });
 
+// ME endpoints (Android can use these)
+function userAuth(req,res,next){
+  const h=req.headers.authorization||""; const t=h.startsWith("Bearer ")?h.slice(7):null;
+  if(!t) return res.status(401).json({error:"Missing token"});
+  try{ req.user = jwt.verify(t,JWT_SECRET); next(); }catch{ return res.status(401).json({error:"Invalid token"}); }
+}
+app.get("/v1/me", userAuth, async (req,res)=>{
+  const coins = await getCoins(req.user.userId);
+  res.json({ userId: req.user.userId, email: req.user.email, coins });
+});
+app.post("/v1/me/coins/add100", userAuth, async (req,res)=>{
+  await addCoins(req.user.userId, 100);
+  const coins = await getCoins(req.user.userId);
+  res.json({ ok:true, coins });
+});
+
+// Admin endpoints
 app.post("/v1/admin/login",(req,res)=>{
   const { username, password } = req.body||{};
   if(username===ADMIN_USER && password===ADMIN_PASS){
@@ -534,7 +547,6 @@ app.post("/v1/admin/login",(req,res)=>{
   }
   return res.status(401).json({error:"Invalid admin credentials"});
 });
-
 function adminAuth(req,res,next){ const h=req.headers.authorization||""; const t=h.startsWith("Bearer ")?h.slice(7):null;
   if(!t) return res.status(401).json({error:"Missing token"}); try{ const p=jwt.verify(t,JWT_SECRET);
   if(p.role!=="admin") return res.status(403).json({error:"Forbidden"}); req.admin=p; next(); }catch{ return res.status(401).json({error:"Invalid token"}); } }
@@ -558,48 +570,103 @@ app.get("/v1/admin/users", adminAuth, async (req,res)=>{
   const r=await db.query(sql,q?[q]:[]); res.json(r.rows);
 });
 app.post("/v1/admin/users/:id/coins/add", adminAuth, async (req,res)=>{
-  await addCoins(req.params.id, Number((req.body||{}).delta||0)); res.json({ok:true, coins: await getCoins(req.params.id)});
+  const delta = Number((req.body||{}).delta||0); await addCoins(req.params.id, delta); res.json({ok:true, coins: await getCoins(req.params.id)});
 });
 app.post("/v1/admin/users/:id/coins/set", adminAuth, async (req,res)=>{
-  await setCoins(req.params.id, Number((req.body||{}).amount||0)); res.json({ok:true, coins: await getCoins(req.params.id)});
+  const amount = Number((req.body||{}).amount||0); await setCoins(req.params.id, amount); res.json({ok:true, coins: await getCoins(req.params.id)});
 });
 app.get("/v1/admin/calls", adminAuth, async (_req,res)=>{
   const r=await db.query("SELECT id,caller_id,callee_id,kind,status,started_at,ended_at FROM calls ORDER BY started_at DESC LIMIT 200"); res.json(r.rows);
 });
 
-// ---------------------
-// Socket.IO AUTH (accept handshake.auth.token OR ?token=)
-// ---------------------
-io.use((socket,next)=>{
-  try{
-    const q = socket.handshake.query || {};
-    const token = socket.handshake.auth?.token || q.token || q['auth[token]'];
-    if(!token) return next(new Error("Auth token required"));
-    const p = jwt.verify(token, JWT_SECRET);
-    socket.data.user = p; // { userId, email }
-    next();
-  }catch{ next(new Error("Invalid token")); }
-});
+// Signaling + upfront charging with handshake refund
+const COST = { audio: 10, video: 50 };
+const userToSocket = new Map();
+const socketToUser = new Map();
 
-// Signaling + charging
-const COST={audio:10,video:50}; const userToSocket=new Map(); const socketToUser=new Map();
+io.use((socket,next)=>{ const t=socket.handshake.auth?.token; if(!t) return next(new Error("Auth token required"));
+  try{ socket.data.user=jwt.verify(t,JWT_SECRET); next(); }catch{ next(new Error("Invalid token")); }});
+
+async function chargeOnce(callId, uid, amount) {
+  await addCoins(uid, -amount);
+  await db.query("INSERT INTO call_charges (id, call_id, user_id, amount) VALUES ($1,$2,$3,$4)", [uuidv4(), callId, uid, -amount]);
+}
+async function refundOnce(callId, uid, amount) {
+  await addCoins(uid, amount);
+  await db.query("INSERT INTO call_charges (id, call_id, user_id, amount) VALUES ($1,$2,$3,$4)", [uuidv4(), callId, uid, amount]);
+}
+
 io.on("connection",(socket)=>{
-  const { userId } = socket.data.user; userToSocket.set(userId,socket.id); socketToUser.set(socket.id,{userId});
+  const { userId } = socket.data.user; userToSocket.set(userId,socket.id); socketToUser.set(socket.id,{userId,inCall:false});
 
   socket.on("joinQueue",async ({kind})=>{
-    if(!["audio","video"].includes(kind)) return; socket.join(`queue:${kind}`);
-    const peers=(await io.in(`queue:${kind}`).fetchSockets()).filter(s=>s.id!==socket.id);
-    if(peers.length>0){
-      const peer=peers[Math.floor(Math.random()*peers.length)];
-      const callId=uuidv4();
-      const calleeId=(socketToUser.get(peer.id)||{}).userId;
-      await db.query("INSERT INTO calls (id,caller_id,callee_id,kind,status) VALUES ($1,$2,$3,$4,'active')",[callId,userId,calleeId,kind]);
-      const room=`call:${callId}`; socket.join(room); peer.join(room); socket.leave(`queue:${kind}`); peer.leave(`queue:${kind}`);
-      await redis.hSet(`call:${callId}`,{kind,status:"active",ts:Date.now().toString()});
-      // Emit explicit roles so only one side offers
-      io.to(socket.id).emit("matchFound",{callId,room,kind,coinRate:COST[kind],role:"caller"});
-      io.to(peer.id).emit("matchFound",{callId,room,kind,coinRate:COST[kind],role:"callee"});
+    if(!["audio","video"].includes(kind)) return;
+
+    // Already in active call?
+    const check = await db.query("SELECT 1 FROM calls WHERE (caller_id=$1 OR callee_id=$1) AND status='active' LIMIT 1",[userId]);
+    if(check.rowCount){ socket.emit("queue:error",{reason:"already-in-call"}); return; }
+
+    const myCoins = await getCoins(userId);
+    const price = COST[kind] || 10;
+    if (myCoins < price) { socket.emit("queue:error",{reason:"insufficient-coins",needed:price}); return; }
+
+    // Enter queue
+    const queueRoom = `queue:${kind}`;
+    socket.join(queueRoom);
+
+    // Find any other waiting peer
+    const peers=(await io.in(queueRoom).fetchSockets()).filter(s=>s.id!==socket.id);
+    if(peers.length===0) return;
+
+    // pick randomly
+    const peer=peers[Math.floor(Math.random()*peers.length)];
+    const peerUserId=(socketToUser.get(peer.id)||{}).userId;
+    if(!peerUserId) return;
+
+    // Re-check balances
+    const [aCoins, bCoins] = await Promise.all([getCoins(userId), getCoins(peerUserId)]);
+    if(aCoins<price || bCoins<price){
+      if(aCoins<price){ socket.leave(queueRoom); socket.emit("queue:error",{reason:"insufficient-coins",needed:price}); }
+      if(bCoins<price){ peer.leave(queueRoom); peer.emit("queue:error",{reason:"insufficient-coins",needed:price}); }
+      return;
     }
+
+    // Create call
+    const callId=uuidv4();
+    await db.query("INSERT INTO calls (id,caller_id,callee_id,kind,status) VALUES ($1,$2,$3,$4,'active')",[callId,userId,peerUserId,kind]);
+    const room=`call:${callId}`;
+    socket.join(room); peer.join(room);
+    socket.leave(queueRoom); peer.leave(queueRoom);
+    (socketToUser.get(socket.id)||{}).inCall=true; (socketToUser.get(peer.id)||{}).inCall=true;
+
+    // Upfront charge both
+    await Promise.all([chargeOnce(callId, userId, price), chargeOnce(callId, peerUserId, price)]);
+
+    // remember call
+    const handshakeDeadline = Date.now() + 15000;
+    await redis.hSet(`call:${callId}`,{kind,status:"active",ts:Date.now().toString()});
+
+    io.to(room).emit("matchFound",{callId,room,kind,coinRate:price});
+
+    // Track SDP seen
+    let sdpSeen=new Set();
+    const markSdp=(sid)=>sdpSeen.add(sid);
+
+    const sSignal=(payload)=>{ if(payload?.type==="sdp-offer" || payload?.type==="sdp-answer"){ markSdp(socket.id); } };
+    const pSignal=(payload)=>{ if(payload?.type==="sdp-offer" || payload?.type==="sdp-answer"){ markSdp(peer.id); } };
+    socket.once("signal",({payload})=>sSignal(payload));
+    peer.once("signal",({payload})=>pSignal(payload));
+
+    // Refund if no handshake
+    const interval=setInterval(async ()=>{
+      if(Date.now()>handshakeDeadline && sdpSeen.size<2){
+        await refundOnce(callId,userId,price);
+        await refundOnce(callId,peerUserId,price);
+        await endCall(callId);
+        clearInterval(interval);
+      }
+      if(sdpSeen.size>=2) clearInterval(interval);
+    },2000);
   });
 
   socket.on("signal",({room,type,payload})=>io.to(room).emit("signal",{from:socket.id,type,payload}));
@@ -608,38 +675,22 @@ io.on("connection",(socket)=>{
 });
 
 async function endCall(callId){
-  const r=await db.query("UPDATE calls SET status='ended', ended_at=NOW() WHERE id=$1 RETURNING *",[callId]);
-  if(!r.rowCount)return; await redis.hSet(`call:${callId}`,{status:"ended"}); const room=`call:${callId}`; io.to(room).emit("callEnded",{callId});
-  const sockets=await io.in(room).fetchSockets(); sockets.forEach(s=>s.leave(room));
+  const r=await db.query("UPDATE calls SET status='ended', ended_at=NOW() WHERE id=$1 AND status='active' RETURNING id",[callId]);
+  if(!r.rowCount)return;
+  await redis.hSet(`call:${callId}`,{status:"ended"});
+  const room=`call:${callId}`;
+  io.to(room).emit("callEnded",{callId});
+  const sockets=await io.in(room).fetchSockets();
+  sockets.forEach(s=>{ const x=socketToUser.get(s.id); if(x) x.inCall=false; s.leave(room); });
 }
-
-// Per-minute charging while active; push live wallet updates
-setInterval(async ()=>{
-  const keys=await redis.keys("call:*");
-  for(const k of keys){
-    const meta=await redis.hGetAll(k);
-    if(!meta || meta.status!=="active") continue;
-    const callId=k.split(":")[1];
-    const r=await db.query("SELECT * FROM calls WHERE id=$1 AND status='active'",[callId]);
-    if(!r.rowCount){ await redis.hSet(k,{status:"ended"}); continue; }
-    const {caller_id,callee_id,kind}=r.rows[0];
-    const cost=COST[kind]||10;
-    const [a,b]=await Promise.all([getCoins(caller_id),getCoins(callee_id)]);
-    if(a<cost||b<cost){ await endCall(callId); continue; }
-    await addCoins(caller_id,-cost); await addCoins(callee_id,-cost);
-    const sa=userToSocket.get(caller_id), sb=userToSocket.get(callee_id);
-    if(sa) io.to(sa).emit("wallet:update",{coins:await getCoins(caller_id)});
-    if(sb) io.to(sb).emit("wallet:update",{coins:await getCoins(callee_id)});
-  }
-},60_000);
 
 app.use("/admin", express.static(path.join(__dirname,"admin")));
 server.listen(PORT, ()=>console.log(`API listening on :${PORT}`));
 SRV
 
-# -------------------------
+# =========================
 # Persist config
-# -------------------------
+# =========================
 printf "%s\n" \
 "LE_EMAIL=${LE_EMAIL}" \
 "SITE_DOMAIN=${SITE_DOMAIN}" \
@@ -653,28 +704,26 @@ printf "%s\n" \
 "TURN_USER=${TURN_USER}" \
 "TURN_PASS=${TURN_PASS}" > .env
 
-# -------------------------
+# =========================
 # Firewall
-# -------------------------
+# =========================
 ufw allow 22/tcp || true
 ufw allow 80,443/tcp || true
 ufw allow 3478/tcp || true
 ufw allow 3478/udp || true
 ufw allow 49152:65535/udp || true
-# If you enable TLS TURN on 5349:
-# ufw allow 5349/tcp || true
 echo "y" | ufw enable || true
 
-# -------------------------
+# =========================
 # Build & start clean
-# -------------------------
+# =========================
 docker compose down --remove-orphans || true
 docker compose build --no-cache
 docker compose up -d --remove-orphans
 
-# -------------------------
+# =========================
 # Uninstall helper
-# -------------------------
+# =========================
 cat > "${APP_DIR}/uninstall.sh" <<'UN'
 #!/usr/bin/env bash
 set -euo pipefail
