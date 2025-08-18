@@ -11,7 +11,7 @@ fi
 read -rp "Let's Encrypt email (TLS certs): " LE_EMAIL
 while [[ -z "${LE_EMAIL}" ]]; do read -rp "Email cannot be empty: " LE_EMAIL; done
 
-read -rp "Site domain (e.g. randomcall.mydomain.xyz): " SITE_DOMAIN
+read -rp "Site domain (e.g. randomcall.yourdomain.com): " SITE_DOMAIN
 while [[ -z "${SITE_DOMAIN}" ]]; do read -rp "Domain cannot be empty: " SITE_DOMAIN; done
 
 read -rp "TURN domain or IP (Enter to use server IP): " TURN_HOST
@@ -51,15 +51,12 @@ systemctl start docker
 # Stop anything on 80/443
 # =========================
 echo "[Cleanup] Stopping anything listening on :80/:443 ..."
-# system nginx (if ever installed)
 systemctl stop nginx 2>/dev/null || true
 systemctl disable nginx 2>/dev/null || true
 
-# old docker proxies by name (best effort)
 docker stop nginx-proxy nginx-proxy-acme 2>/dev/null || true
 docker rm   nginx-proxy nginx-proxy-acme 2>/dev/null || true
 
-# any container that maps 0.0.0.0:80 or :443
 mapfile -t OLD80 < <(docker ps --format '{{.ID}} {{.Ports}}' | awk '/0.0.0.0:80->/ {print $1}')
 mapfile -t OLD443 < <(docker ps --format '{{.ID}} {{.Ports}}' | awk '/0.0.0.0:443->/ {print $1}')
 for id in "${OLD80[@]}" "${OLD443[@]}"; do
@@ -84,7 +81,7 @@ TURN_PASS="${TURN_PASS:-$(openssl rand -hex 16)}"
 mkdir -p data/postgres data/redis server admin caddy
 
 # =========================
-# Compose (Caddy reverse proxy)
+# docker-compose (Caddy reverse proxy)
 # =========================
 cat > docker-compose.yml <<'YML'
 services:
@@ -151,6 +148,8 @@ services:
       TURN_USERNAME: ${TURN_USER}
       TURN_PASSWORD: ${TURN_PASS}
       TURN_PORT: 3478
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock   # <— FIX: let admin see/restart services
     healthcheck:
       test: ["CMD","node","/usr/src/app/healthcheck.js"]
       interval: 20s
@@ -181,7 +180,7 @@ services:
 YML
 
 # =========================
-# Caddyfile
+# Caddyfile (auto-HTTPS)
 # =========================
 cat > caddy/Caddyfile <<CADDY
 {
@@ -216,7 +215,7 @@ DOCKER
 cat > server/package.json <<'PKG'
 {
   "name": "random-call-backend",
-  "version": "1.3.0",
+  "version": "1.3.1",
   "type": "module",
   "main": "server.js",
   "scripts": { "start": "node server.js" },
@@ -289,46 +288,142 @@ const req = http.get("http://127.0.0.1:3000/health", res => process.exit(res.sta
 req.on("error", () => process.exit(1));
 HC
 
-# Admin static UI (baked into the image)
+# --- Admin UI (verbose + global handlers) ---
 mkdir -p admin
 cat > admin/index.html <<'HTML'
 <!doctype html><html><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
 <title>RandomCall Admin</title>
-<style>body{font-family:system-ui,Arial;margin:24px}.card{border:1px solid #ddd;border-radius:12px;padding:16px;margin-bottom:16px}
-input,button{padding:8px;margin:4px}table{border-collapse:collapse;width:100%}th,td{padding:8px;border-bottom:1px solid #eee;text-align:left}
-.ok{color:#0a7}.bad{color:#d33}.hidden{display:none}</style></head><body>
+<style>
+body{font-family:system-ui,Arial;margin:24px}.card{border:1px solid #ddd;border-radius:12px;padding:16px;margin-bottom:16px}
+input,button{padding:8px;margin:4px}#msg{margin-top:8px}table{border-collapse:collapse;width:100%}th,td{padding:8px;border-bottom:1px solid #eee;text-align:left}
+.ok{color:#0a7}.bad{color:#d33}.hidden{display:none}
+</style></head><body>
 <h2>RandomCall Admin</h2>
-<div id="login" class="card"><h3>Login</h3><input id="u" placeholder="Admin username"/><input id="p" type="password" placeholder="Admin password"/>
-<button onclick="login()">Login</button><div id="loginStatus"></div></div>
+<div id="login" class="card">
+  <h3>Login</h3>
+  <input id="u" placeholder="Admin username"/>
+  <input id="p" type="password" placeholder="Admin password"/>
+  <button onclick="login()">Login</button>
+  <div id="msg"></div>
+</div>
+
 <div id="panel" class="hidden">
   <div class="card"><h3>Service Status</h3><div id="services"></div></div>
-  <div class="card"><h3>Users</h3><input id="q" placeholder="Search email or name"/><button onclick="loadUsers()">Search</button>
-    <table id="usersTbl"><thead><tr><th>Email</th><th>Name</th><th>Coins</th><th>Actions</th></tr></thead><tbody></tbody></table></div>
-  <div class="card"><h3>Recent Calls</h3><table id="callsTbl"><thead><tr><th>ID</th><th>Kind</th><th>Status</th><th>Start</th><th>End</th></tr></thead><tbody></tbody></table></div>
+  <div class="card"><h3>Users</h3>
+    <input id="q" placeholder="Search email or name"/><button onclick="loadUsers()">Search</button>
+    <table id="usersTbl"><thead><tr><th>Email</th><th>Name</th><th>Coins</th><th>Actions</th></tr></thead><tbody></tbody></table>
+  </div>
+  <div class="card"><h3>Recent Calls</h3>
+    <table id="callsTbl"><thead><tr><th>ID</th><th>Kind</th><th>Status</th><th>Start</th><th>End</th></tr></thead><tbody></tbody></table>
+  </div>
 </div>
+
 <script>
-const base=location.origin;let token=localStorage.getItem("admintoken")||"";function setVisible(i,s){document.getElementById(i).classList.toggle("hidden",!s)}
-async function login(){const u=document.getElementById("u").value.trim();const p=document.getElementById("p").value;
- const r=await fetch(base+"/v1/admin/login",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({username:u,password:p})});
- if(!r.ok){document.getElementById("loginStatus").innerText="Login failed";return}const j=await r.json();token=j.token;localStorage.setItem("admintoken",token);
- setVisible("login",false);setVisible("panel",true);refreshAll()}
-async function refreshAll(){loadServices();loadUsers();loadCalls()}function auth(){return{"Authorization":"Bearer "+token}}
-async function loadServices(){const r=await fetch(base+"/v1/admin/services",{headers:auth()});if(!r.ok)return;const list=await r.json();const el=document.getElementById("services");el.innerHTML="";
- list.forEach(s=>{const d=document.createElement("div");d.innerHTML=`<strong>${s.name}</strong> : <span class="${s.running?"ok":"bad"}">${s.state}</span> <button onclick="restartSvc('${s.name}')">Restart</button>`;el.appendChild(d)});}
-async function restartSvc(n){await fetch(base+"/v1/admin/services/"+n+"/restart",{method:"POST",headers:auth()});loadServices()}
-async function loadUsers(){const q=document.getElementById("q").value.trim();const r=await fetch(base+"/v1/admin/users"+(q?("?q="+encodeURIComponent(q)):""),{headers:auth()});if(!r.ok)return;
- const users=await r.json();const tb=document.querySelector("#usersTbl tbody");tb.innerHTML="";users.forEach(u=>{const tr=document.createElement("tr");
- tr.innerHTML=`<td>${u.email}</td><td>${u.display_name||""}</td><td>${u.coins}</td><td>
- <button onclick="coinAdd('${u.id}',10)">+10</button><button onclick="coinAdd('${u.id}',100)">+100</button>
- <button onclick="coinAdd('${u.id}',-10)">-10</button><button onclick="coinSet('${u.id}')">Set…</button></td>`;tb.appendChild(tr);});}
-async function coinAdd(id,delta){await fetch(base+"/v1/admin/users/"+id+"/coins/add",{method:"POST",headers:{...auth(),"Content-Type":"application/json"},body:JSON.stringify({delta})});loadUsers()}
-async function coinSet(id){const v=prompt("Set new coin balance:");if(v===null)return;const a=parseInt(v,10);if(isNaN(a))return alert("Invalid number");
- await fetch(base+"/v1/admin/users/"+id+"/coins/set",{method:"POST",headers:{...auth(),"Content-Type":"application/json"},body:JSON.stringify({amount:a})});loadUsers()}
-async function loadCalls(){const r=await fetch(base+"/v1/admin/calls",{headers:auth()});if(!r.ok)return;const rows=await r.json();const tb=document.querySelector("#callsTbl tbody");tb.innerHTML="";
- rows.forEach(c=>{const tr=document.createElement("tr");tr.innerHTML=`<td>${c.id}</td><td>${c.kind}</td><td>${c.status}</td><td>${c.started_at}</td><td>${c.ended_at||""}</td>`;tb.appendChild(tr);});}
-if(token){setVisible("login",false);setVisible("panel",true);refreshAll()}
+const base = location.origin;
+const $ = id => document.getElementById(id);
+const setMsg = (t, ok=false) => { const el=$('msg'); el.textContent=t; el.style.color=ok?'#0a7':'#d33'; };
+
+window.login = async function(){
+  setMsg('Logging in…', true);
+  const username = $('u').value.trim();
+  const password = $('p').value;
+  try{
+    const r = await fetch(base + '/v1/admin/login', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({ username, password })
+    });
+    if(!r.ok){ setMsg('Login failed: ' + (await r.text()), false); return; }
+    const j = await r.json();
+    localStorage.setItem('admintoken', j.token);
+    $('login').classList.add('hidden'); $('panel').classList.remove('hidden');
+    setMsg(''); await refreshAll();
+  }catch(e){ setMsg('Network/JS error: ' + e); console.error(e); }
+}
+
+function authHeaders(){ return { 'Authorization':'Bearer ' + (localStorage.getItem('admintoken')||'') }; }
+
+window.loadServices = async function(){
+  try{
+    const r = await fetch(base + '/v1/admin/services', { headers: authHeaders() });
+    if(!r.ok){ setMsg('Failed to load services: ' + r.status); return; }
+    const list = await r.json();
+    const el = document.getElementById('services'); el.innerHTML = "";
+    list.forEach(s => {
+      const div = document.createElement('div');
+      div.innerHTML = `<strong>${s.name}</strong> :
+        <span class="${s.running ? 'ok':'bad'}">${s.state}</span>
+        <button onclick="restartSvc('${s.name}')">Restart</button>`;
+      el.appendChild(div);
+    });
+  }catch(e){ setMsg('Services error: ' + e); }
+}
+
+window.restartSvc = async function(name){
+  await fetch(base + '/v1/admin/services/' + name + '/restart', { method:'POST', headers: authHeaders() });
+  await loadServices();
+}
+
+window.loadUsers = async function(){
+  const q = $('q').value.trim();
+  const r = await fetch(base + '/v1/admin/users' + (q?('?q='+encodeURIComponent(q)):""), { headers: authHeaders() });
+  if(!r.ok){ setMsg('Failed to load users: ' + r.status); return; }
+  const users = await r.json();
+  const tb = document.querySelector('#usersTbl tbody'); tb.innerHTML = "";
+  users.forEach(u => {
+    const tr = document.createElement('tr');
+    tr.innerHTML = `<td>${u.email}</td><td>${u.display_name||''}</td><td>${u.coins}</td>
+      <td>
+        <button onclick="coinAdd('${u.id}',10)">+10</button>
+        <button onclick="coinAdd('${u.id}',100)">+100</button>
+        <button onclick="coinAdd('${u.id}',-10)">-10</button>
+        <button onclick="coinSetPrompt('${u.id}')">Set…</button>
+      </td>`;
+    tb.appendChild(tr);
+  });
+}
+
+window.coinAdd = async function(id, delta){
+  await fetch(base + '/v1/admin/users/'+id+'/coins/add', {
+    method:'POST', headers:{...authHeaders(),'Content-Type':'application/json'},
+    body: JSON.stringify({ delta })
+  });
+  await loadUsers();
+}
+
+window.coinSetPrompt = async function(id){
+  const v = prompt("Set new coin balance:");
+  if(v===null) return;
+  const amount = parseInt(v,10);
+  if(isNaN(amount)) return alert("Invalid number");
+  await fetch(base + '/v1/admin/users/'+id+'/coins/set', {
+    method:'POST', headers:{...authHeaders(),'Content-Type':'application/json'},
+    body: JSON.stringify({ amount })
+  });
+  await loadUsers();
+}
+
+async function loadCalls(){
+  const r = await fetch(base + '/v1/admin/calls', { headers: authHeaders() });
+  if(!r.ok){ setMsg('Failed to load calls: ' + r.status); return; }
+  const rows = await r.json();
+  const tb = document.querySelector('#callsTbl tbody'); tb.innerHTML = "";
+  rows.forEach(c => {
+    const tr = document.createElement('tr');
+    tr.innerHTML = `<td>${c.id}</td><td>${c.kind}</td><td>${c.status}</td><td>${c.started_at}</td><td>${c.ended_at||''}</td>`;
+    tb.appendChild(tr);
+  });
+}
+
+async function refreshAll(){ await loadServices(); await loadUsers(); await loadCalls(); }
+
+(function(){
+  const t = localStorage.getItem('admintoken');
+  if(t){ $('login').classList.add('hidden'); $('panel').classList.remove('hidden'); refreshAll().catch(console.error); }
+})();
 </script></body></html>
 HTML
+
+# copy admin into server so it’s inside the image
 cp -r admin server/admin
 
 cat > server/server.js <<'SRV'
@@ -358,9 +453,9 @@ const io = new SocketIOServer(server, { cors: { origin: "*" }, path: "/socket.io
 
 const { Pool } = pkg; const db = new Pool({ connectionString: DATABASE_URL });
 const redis = createRedisClient({ url: REDIS_URL }); await redis.connect();
-
 const googleClient = new OAuth2Client(GOOGLE_CLIENT_ID);
 
+// helpers
 async function ensureUser(email, name, avatar){ const r = await db.query("SELECT id FROM users WHERE email=$1",[email]);
   if(r.rowCount) return r.rows[0].id; const id = uuidv4();
   await db.query("INSERT INTO users (id,email,display_name,avatar_url) VALUES ($1,$2,$3,$4)",[id,email,name||"",avatar||""]);
@@ -460,19 +555,19 @@ SRV
 # =========================
 # Persist config
 # =========================
-cat > .env <<EOF
-LE_EMAIL=${LE_EMAIL}
-SITE_DOMAIN=${SITE_DOMAIN}
-DB_PASS=${DB_PASS}
-REDIS_PASS=${REDIS_PASS}
-JWT_SECRET=${JWT_SECRET}
-GOOGLE_CLIENT_ID=${GOOGLE_CLIENT_ID}
-ADMIN_USER=${ADMIN_USER}
-ADMIN_PASS=${ADMIN_PASS}
-TURN_HOST=${TURN_HOST}
-TURN_USER=${TURN_USER}
-TURN_PASS=${TURN_PASS}
-EOF
+# normalize line endings & spaces (in case of re-runs)
+printf "%s\n" \
+"LE_EMAIL=${LE_EMAIL}" \
+"SITE_DOMAIN=${SITE_DOMAIN}" \
+"DB_PASS=${DB_PASS}" \
+"REDIS_PASS=${REDIS_PASS}" \
+"JWT_SECRET=${JWT_SECRET}" \
+"GOOGLE_CLIENT_ID=${GOOGLE_CLIENT_ID}" \
+"ADMIN_USER=${ADMIN_USER}" \
+"ADMIN_PASS=${ADMIN_PASS}" \
+"TURN_HOST=${TURN_HOST}" \
+"TURN_USER=${TURN_USER}" \
+"TURN_PASS=${TURN_PASS}" > .env
 
 # =========================
 # Firewall
@@ -485,7 +580,7 @@ ufw allow 49152:65535/udp || true
 echo "y" | ufw enable || true
 
 # =========================
-# Build and start (clean)
+# Build & start clean
 # =========================
 docker compose down --remove-orphans || true
 docker compose build --no-cache
